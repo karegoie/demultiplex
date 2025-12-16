@@ -8,7 +8,7 @@ use bio::alphabets::dna::revcomp;
 use clap::Parser;
 use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
-use seq_io::fastq::Reader;
+use seq_io::fastq::{Reader, Record};
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
@@ -84,8 +84,8 @@ fn read_samples(path: &PathBuf) -> Result<Vec<SampleRecord>> {
             .to_ascii_uppercase();
         out.push(SampleRecord {
             id: sample_id,
-            primer_a_rc: revcomp(primer_a.as_bytes()),
-            primer_b_rc: revcomp(primer_b.as_bytes()),
+            primer_a_rc: String::from_utf8(revcomp(primer_a.as_bytes()))?,
+            primer_b_rc: String::from_utf8(revcomp(primer_b.as_bytes()))?,
             primer_a,
             primer_b,
         });
@@ -241,10 +241,8 @@ fn main() -> Result<()> {
                 1u64,
             ))
         })
-        .fold(HashMap::new, |mut acc, k| {
-            if let Some((key, c)) = k {
-                *acc.entry(key).or_insert(0) += c;
-            }
+        .fold(HashMap::new, |mut acc, (key, c)| {
+            *acc.entry(key).or_insert(0) += c;
             acc
         })
         .reduce(HashMap::new, |mut a, b| {
