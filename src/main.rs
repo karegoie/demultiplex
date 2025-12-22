@@ -205,7 +205,7 @@ struct OutputRow {
     count: u32,
 }
 
-const CHUNK_SIZE: usize = 10000; // Process 10000 paired-end reads at a time
+const CHUNK_SIZE: usize = 100000; // Process 100000 paired-end reads at a time
 
 fn read_pairs_chunked(
     r1_reader: &mut FastqReader<MultiGzDecoder<BufReader<File>>>,
