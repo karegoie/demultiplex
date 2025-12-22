@@ -1,3 +1,6 @@
 target/
 *.fastq
 *.fastq.gz
+*.csv
+*.txt
+Cargo.lock

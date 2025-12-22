@@ -1,18 +1,13 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use anyhow::{anyhow, Context, Result};
-use bio::alphabets::dna::revcomp;
-use block_aligner::scan_block::{Block, PaddedBytes};
-use block_aligner::scores::{Gaps, NucMatrix};
-use clap::Parser;
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
-use seq_io::fastq::{Reader, Record};
 use serde::Serialize;
+use clap::Parser;
+use std::path::PathBuf;
+use std::fs::File;
+use flate2::read::MultiGzDecoder;
+use std::io::BufReader;
+use anyhow::{anyhow, Context, Result};
+use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
+use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Multiplexed amplicon demultiplexing and quantification")]
@@ -27,8 +22,6 @@ struct Args {
     genes: PathBuf,
     #[arg(long)]
     output: PathBuf,
-    #[arg(long, default_value_t = num_cpus::get())]
-    threads: usize,
     #[arg(long, default_value_t = false)]
     debug: bool,
 }
@@ -48,21 +41,7 @@ struct GeneRecord {
     wt: String,
 }
 
-#[derive(Serialize)]
-struct OutputRow {
-    sample_id: String,
-    gene_id: String,
-    r#type: String,
-    sequence: String,
-    count: u64,
-    percentage: f64,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ReadOrientation {
-    R1FwdR2Rev,
-    R1RevR2Fwd,
-}
+// --- 1. Define Reference Data ---
 
 fn read_genes(path: &PathBuf) -> Result<Vec<GeneRecord>> {
     let mut rdr = csv::ReaderBuilder::new()
@@ -127,16 +106,10 @@ fn read_samples(path: &PathBuf) -> Result<Vec<SampleRecord>> {
     Ok(out)
 }
 
-fn load_fastq_pairs(r1: &PathBuf, r2: &PathBuf) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let r1_file = File::open(r1)?;
-    let r2_file = File::open(r2)?;
-    let mut r1_reader = Reader::new(MultiGzDecoder::new(BufReader::new(r1_file)));
-    let mut r2_reader = Reader::new(MultiGzDecoder::new(BufReader::new(r2_file)));
-    let mut pairs = Vec::new();
-    while let (Some(r1), Some(r2)) = (r1_reader.next(), r2_reader.next()) {
-        pairs.push((r1?.seq().to_vec(), r2?.seq().to_vec()));
-    }
-    Ok(pairs)
+#[derive(Copy, Clone, Debug)]
+enum ReadOrientation {
+    R1FwdR2Rev,
+    R1RevR2Fwd,
 }
 
 fn matches_start(read: &[u8], primer: &[u8], max_mismatch: usize) -> bool {
@@ -159,7 +132,7 @@ fn detect_sample<'a>(samples: &'a [SampleRecord], r1: &[u8], r2: &[u8]) -> Optio
 
 fn merge_reads(r1: &[u8], r2: &[u8], min_overlap: usize, max_mismatch: usize) -> Option<Vec<u8>> {
     let len1 = r1.len();
-    let r2_rc = revcomp(r2);
+    let r2_rc = bio::alphabets::dna::revcomp(r2); // Use bio crate for revcomp
     let max_olap = len1.min(r2_rc.len());
     for olap in (min_overlap..=max_olap).rev() {
         let r1_suffix = &r1[len1 - olap..];
@@ -174,184 +147,183 @@ fn merge_reads(r1: &[u8], r2: &[u8], min_overlap: usize, max_mismatch: usize) ->
     None 
 }
 
-// 반환값 변경: String -> bool (is_reverse_complement)
-fn best_alignment_dual<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, bool, f64, bool) {
-    if genes.is_empty() {
-        return ("Unknown", false, f64::NEG_INFINITY, false);
-    }
-    let (id_f, score_f) = align_to_genes(genes, seq);
-    let seq_rc = revcomp(seq);
-    let (id_r, score_r) = align_to_genes(genes, &seq_rc);
-
-    if score_f >= score_r {
-        (id_f, false, score_f, false) // false = Forward
-    } else {
-        (id_r, false, score_r, true)  // true = Reverse Complement
-    }
-}
-
-fn align_to_genes<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64) {
-    let max_ref = genes.iter().map(|g| g.wt.len()).max().unwrap_or(1).max(1);
-    let max_query = seq.len().max(1);
-    let max_len = max_ref.max(max_query);
-    let max_block_size = max_len.next_power_of_two().max(64).min(2048); 
-    
-    let matrix = NucMatrix::new_simple(2, -3); 
-    let gaps = Gaps { open: -5, extend: -1 }; 
-    let mut block = Block::<true, false>::new(max_query, max_ref, max_block_size);
-    let q = PaddedBytes::from_bytes::<NucMatrix>(seq, max_block_size);
-
-    let mut best_id = "Unknown";
-    let mut best_norm = f64::NEG_INFINITY;
-
-    for g in genes {
-        let r = PaddedBytes::from_bytes::<NucMatrix>(g.wt.as_bytes(), max_block_size);
-        block.align(&q, &r, &matrix, gaps, 32..=max_block_size, 0); 
-        let res = block.res();
-        let score = res.score as f64;
-        let max_score = (2 * g.wt.len().max(seq.len())) as f64; 
-        let norm = score / max_score;
-
-        if norm > best_norm {
-            best_norm = norm;
-            best_id = g.id.as_str();
+fn calculate_similarity_bytes(seq1: &[u8], seq2: &[u8]) -> f64 {
+    let mut matches = 0;
+    let min_len = std::cmp::min(seq1.len(), seq2.len());
+    if min_len == 0 { return 0.0; }
+    for i in 0..min_len {
+        if seq1[i] == seq2[i] {
+            matches += 1;
         }
     }
-    (best_id, best_norm)
+    matches as f64 / min_len as f64
 }
 
-fn main() -> Result<()> {
+fn separate_gene_read(sequence: &[u8], genes: &[GeneRecord]) -> Option<(String, Vec<u8>)> {
+    const SIMILARITY_THRESHOLD: f64 = 0.8; 
+
+    let mut best_gene_id: Option<&str> = None;
+    let mut best_similarity: f64 = -1.0;
+
+    for gene in genes {
+        let sim = calculate_similarity_bytes(sequence, gene.wt.as_bytes());
+        if sim > best_similarity {
+            best_similarity = sim;
+            best_gene_id = Some(&gene.id);
+        }
+    }
+
+    if let Some(gene_id) = best_gene_id {
+        if best_similarity >= SIMILARITY_THRESHOLD {
+            return Some((gene_id.to_string(), sequence.to_vec()));
+        }
+    }
+    None
+}
+
+fn classify_mutation_bytes(sequence: &[u8], wt_sequence: &[u8]) -> (String, Vec<u8>) {
+    if sequence == wt_sequence {
+        ("Wild Type".to_string(), wt_sequence.to_vec())
+    } else {
+        ("Mutation".to_string(), sequence.to_vec())
+    }
+}
+
+// --- 5. Main Pipeline & Output ---
+
+#[derive(Serialize)]
+struct OutputRow {
+    #[serde(rename = "Sample_ID")]
+    sample_id: String,
+    #[serde(rename = "Gene")]
+    gene: String,
+    #[serde(rename = "Variant_Type")]
+    variant_type: String,
+    #[serde(rename = "Sequence")]
+    sequence: String,
+    #[serde(rename = "Count")]
+    count: u32,
+}
+
+const CHUNK_SIZE: usize = 10000; // Process 10000 paired-end reads at a time
+
+fn read_pairs_chunked(
+    r1_reader: &mut FastqReader<MultiGzDecoder<BufReader<File>>>,
+    r2_reader: &mut FastqReader<MultiGzDecoder<BufReader<File>>>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error>> {
+    let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+    for _ in 0..CHUNK_SIZE {
+        match (r1_reader.next(), r2_reader.next()) {
+            (Some(Ok(r1_rec)), Some(Ok(r2_rec))) => {
+                chunk.push((r1_rec.seq().to_vec(), r2_rec.seq().to_vec()));
+            },
+            (None, None) => break, // End of both files
+            (Some(Err(e)), _) | (_, Some(Err(e))) => return Err(e.into()), // Error reading
+            (Some(_), None) | (None, Some(_)) => return Err(anyhow!("Mismatched number of reads in R1 and R2 files").into()), // Mismatched reads
+        }
+    }
+    Ok(chunk)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global()?;
 
-    let genes = read_genes(&args.genes).context("Reading genes")?;
+    rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get()).build_global()?;
+
+    // --- Read reference data ---
+    let samples = read_samples(&args.samples).context("Failed to read samples file")?;
+    let genes = read_genes(&args.genes).context("Failed to read genes file")?;
+
     let gene_map: HashMap<String, String> = genes.iter().map(|g| (g.id.clone(), g.wt.clone())).collect();
-    
-    let samples = read_samples(&args.samples).context("Reading samples")?;
-    let pairs = load_fastq_pairs(&args.r1, &args.r2).context("Loading FASTQ pairs")?;
 
-    let demux_hits = AtomicUsize::new(0);
-    let merged_success = AtomicUsize::new(0);
+    let r1_file = File::open(&args.r1)?;
+    let r2_file = File::open(&args.r2)?;
 
-    let debug_log = if args.debug {
-        Some(File::create("debug_mismatches.txt")?)
-    } else {
-        None
-    };
+    let mut r1_reader = FastqReader::new(MultiGzDecoder::new(BufReader::new(r1_file)));
+    let mut r2_reader = FastqReader::new(MultiGzDecoder::new(BufReader::new(r2_file)));
 
-    let counts: HashMap<(String, String, String), (String, u64)> = pairs
-        .par_iter()
-        .filter_map(|(r1, r2)| {
-            let (sample, orientation) = detect_sample(&samples, r1, r2)?;
-            demux_hits.fetch_add(1, Ordering::Relaxed);
+    let mut results_map: HashMap<(String, String, String, String), u32> = HashMap::new();
 
-            let merged = merge_reads(r1, r2, 10, 3)?; 
-            merged_success.fetch_add(1, Ordering::Relaxed);
+    let mut total_reads_processed = 0;
+    // Process reads in a streaming and parallel manner
+    loop {
+        let chunk = read_pairs_chunked(&mut r1_reader, &mut r2_reader)?;
+        if chunk.is_empty() { break; }
 
-            // 1. Trimming (WT 판별 및 Alignment용)
-            let mut trimmed = merged.clone();
-            let start_trim = match orientation {
-                ReadOrientation::R1FwdR2Rev => sample.primer_a_len,
-                ReadOrientation::R1RevR2Fwd => sample.primer_b_len,
-            };
-            let end_trim = match orientation {
-                ReadOrientation::R1FwdR2Rev => sample.primer_b_len,
-                ReadOrientation::R1RevR2Fwd => sample.primer_a_len,
-            };
+        let chunk_results: Vec<HashMap<(String, String, String, String), u32>> = chunk.par_iter().map(|(r1_seq, r2_seq)| {
+            let mut local_results_map: HashMap<(String, String, String, String), u32> = HashMap::new();
+            
+            // 1. Demultiplexing and Read Orientation Detection
+            if let Some((sample_record, orientation)) = detect_sample(&samples, r1_seq, r2_seq) {
+                // 2. Merge Reads
+                if let Some(merged_seq) = merge_reads(r1_seq, r2_seq, 10, 3) {
+                    // 3. Trimming
+                    let mut trimmed_seq = merged_seq.clone();
+                    let start_trim = match orientation {
+                        ReadOrientation::R1FwdR2Rev => sample_record.primer_a_len,
+                        ReadOrientation::R1RevR2Fwd => sample_record.primer_b_len,
+                    };
+                    let end_trim = match orientation {
+                        ReadOrientation::R1FwdR2Rev => sample_record.primer_b_len,
+                        ReadOrientation::R1RevR2Fwd => sample_record.primer_a_len,
+                    };
 
-            if trimmed.len() > start_trim + end_trim + 10 {
-                trimmed = trimmed[start_trim..trimmed.len() - end_trim].to_vec();
+                    if trimmed_seq.len() > start_trim + end_trim {
+                        trimmed_seq = trimmed_seq[start_trim..trimmed_seq.len() - end_trim].to_vec();
+                    } else {
+                        // If trimmed sequence is too short, skip
+                        return local_results_map; 
+                    }
+                    
+                    // 4. Gene Separation
+                    if let Some((gene_id, gene_sequence_bytes)) = separate_gene_read(&trimmed_seq, &genes) {
+                        let wt_sequence_str = gene_map.get(&gene_id).unwrap(); 
+                        
+                        // 5. Mutation Classification
+                        let (variant_type_str, sequence_bytes) = classify_mutation_bytes(&gene_sequence_bytes, wt_sequence_str.as_bytes());
+
+                        *local_results_map.entry((sample_record.id.clone(), gene_id, variant_type_str, String::from_utf8_lossy(&sequence_bytes).to_string())).or_insert(0) += 1;
+                    } else {
+                        // Unassigned gene within a demultiplexed sample
+                        *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
+                    }
+
+                } else {
+                    // Unmerged read in a demultiplexed sample
+                    *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unmerged".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
+                }
             } else {
-                return None; 
+                // Unidentified sample
+                *local_results_map.entry(("Unidentified".to_string(), "N/A".to_string(), "N/A".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
             }
+            local_results_map
+        }).collect();
 
-            // 2. Alignment (ID 찾기 및 방향 확인)
-            // is_rc: 이 Read가 Gene 기준 역방향인지 확인
-            let (gene_id, _, _score, is_rc) = best_alignment_dual(&genes, &trimmed);
-            
-            // 3. WT 판별 (Trimmed Sequence 기준)
-            let wt_seq_str = gene_map.get(gene_id).unwrap();
-            let wt_upper = wt_seq_str.to_ascii_uppercase();
-
-            // 판별을 위해 trimmed 서열도 방향을 맞춤
-            let trimmed_oriented = if is_rc { revcomp(&trimmed) } else { trimmed.clone() };
-            let trimmed_str = String::from_utf8_lossy(&trimmed_oriented).to_ascii_uppercase();
-
-            let is_contained = wt_upper.contains(&trimmed_str) || trimmed_str.contains(&wt_upper);
-            let final_wt_check = is_contained; 
-            
-            let type_str = if final_wt_check { "WT" } else { "Mutant" };
-            
-            // 4. 최종 Output 서열 결정
-            // WT -> 깔끔한 Reference 서열
-            // Mutant -> 프라이머가 포함된 'Merged Full Sequence' (단, 유전자 방향에 맞게 정렬)
-            let final_seq = if final_wt_check { 
-                wt_seq_str.clone()
-            } else { 
-                let merged_oriented = if is_rc { revcomp(&merged) } else { merged.clone() };
-                String::from_utf8_lossy(&merged_oriented).to_string()
-            };
-
-            Some(((sample.id.clone(), gene_id.to_string(), final_seq), (type_str.to_string(), 1u64)))
-        })
-        .fold(HashMap::new, |mut acc, (key, (vtype, c))| {
-            let entry = acc.entry(key).or_insert((vtype, 0));
-            entry.1 += c;
-            acc
-        })
-        .reduce(HashMap::new, |mut a, b| {
-            for (k, (vtype, count)) in b {
-                let entry = a.entry(k).or_insert((vtype, 0));
-                entry.1 += count;
-            }
-            a
-        });
-
-    let mut wtr = csv::Writer::from_path(&args.output)?;
-    
-    let mut group_totals: HashMap<(String, String), u64> = HashMap::new();
-    for ((s, g, _seq), (_, c)) in counts.iter() {
-        *group_totals.entry((s.clone(), g.clone())).or_insert(0) += *c;
-    }
-
-    let mut rows: Vec<_> = counts.into_iter().collect();
-    rows.sort_by(|a, b| {
-        a.0.0.cmp(&b.0.0)
-            .then(a.0.1.cmp(&b.0.1))
-            .then(b.1.0.cmp(&a.1.0))
-            .then(b.1.1.cmp(&a.1.1))
-    });
-
-    if let Some(mut f) = debug_log {
-        writeln!(f, "SampleID\tGeneID\tCount\tType\tRead_Sequence\tExpected_WT_Sequence")?;
-        for ((s, g, seq), (t, c)) in rows.iter().take(50) {
-            if t == "Mutant" {
-                let expected = gene_map.get(g).unwrap();
-                writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}", s, g, c, t, seq, expected)?;
+        // Aggregate local results into the main results_map
+        for local_map in chunk_results {
+            for (key, count) in local_map {
+                *results_map.entry(key).or_insert(0) += count;
             }
         }
-        eprintln!("Debug log written to 'debug_mismatches.txt'.");
+        total_reads_processed += chunk.len();
+        if args.debug {
+            eprintln!("Processed {} reads...", total_reads_processed);
+        }
     }
 
-    for ((sample, gene, seq), (vtype, count)) in rows {
-        let total = *group_totals.get(&(sample.clone(), gene.clone())).unwrap_or(&1);
-        let pct = (count as f64 / total as f64) * 100.0;
-        
+    // --- Generate Output CSV ---
+    let mut wtr = csv::Writer::from_path(&args.output)?;
+    for ((sample_id, gene, variant_type, sequence), count) in results_map {
         wtr.serialize(OutputRow {
-            sample_id: sample,
-            gene_id: gene,
-            r#type: vtype,
-            sequence: seq,
+            sample_id,
+            gene,
+            variant_type,
+            sequence,
             count,
-            percentage: pct,
         })?;
     }
     wtr.flush()?;
-
-    if args.debug {
-        eprintln!("Demultiplexed Reads: {}", demux_hits.load(Ordering::Relaxed));
-        eprintln!("Successfully Merged: {}", merged_success.load(Ordering::Relaxed));
-    }
+    println!("Analysis complete. Summary saved to {}", args.output.display());
 
     Ok(())
 }
