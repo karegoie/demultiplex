@@ -4,3 +4,5 @@ target/
 *.csv
 *.txt
 Cargo.lock
+!test_1.fastq.gz
+!test_2.fastq.gz

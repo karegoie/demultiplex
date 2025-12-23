@@ -8,9 +8,9 @@ clap = { version = "*", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 csv = "1.1"
 seq_io = "*"
-flate2 = "*"
 anyhow = "*"
 bio = "*"
 rayon = "*"
 block-aligner = { version = "0.5", default-features = false, features = ["simd_avx2"] }
 num_cpus = "*"
+flate2 = "*"
