@@ -129,12 +129,12 @@ enum ReadOrientation {
     R1RevR2Fwd,
 }
 
-fn align_primer<'a>(read: &'a [u8], primer: &'a [u8]) -> Option<(i32, usize)> {
+fn align_primer<'a>(read: &'a [u8], primer: &'a [u8]) -> Option<(i32, usize, usize)> {
     let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
     let mut aligner = Aligner::with_capacity(primer.len(), read.len(), -5, -1, &score);
     let alignment = aligner.semiglobal(primer, read);
     
-    Some((alignment.score, alignment.yend))
+    Some((alignment.score, alignment.ystart, alignment.yend))
 }
 
 fn detect_sample_with_alignment<'a>(samples: &'a [SampleRecord], r1: &'a [u8], r2: &'a [u8], debug: bool) -> Option<(&'a SampleRecord, ReadOrientation, usize, usize)> {
@@ -142,39 +142,39 @@ fn detect_sample_with_alignment<'a>(samples: &'a [SampleRecord], r1: &'a [u8], r
 
     for s in samples {
         // R1-Fwd, R2-Fwd
-        if let (Some((score1, end1)), Some((score2, end2))) = (align_primer(r1, &s.primer_a), align_primer(r2, &s.primer_b)) {
+        if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_a), align_primer(r2, &s.primer_b)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_a.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_b.len() as f64);
             if debug { eprintln!("Sample: {}, R1Fwd/R2Fwd scores: {:.2} ({}), {:.2} ({})", s.id, norm_score1, score1, norm_score2, score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1FwdR2Rev, end1, end2));
+                return Some((s, ReadOrientation::R1FwdR2Rev, start1, start2));
             }
         }
         // R1-Rev, R2-Rev
-        if let (Some((score1, end1)), Some((score2, end2))) = (align_primer(r1, &s.primer_b), align_primer(r2, &s.primer_a)) {
+        if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_b), align_primer(r2, &s.primer_a)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_b.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_a.len() as f64);
             if debug { eprintln!("Sample: {}, R1Rev/R2Rev scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1RevR2Fwd, end1, end2));
+                return Some((s, ReadOrientation::R1RevR2Fwd, start1, start2));
             }
         }
         // R1-Fwd-RC, R2-Fwd-RC
-        if let (Some((score1, end1)), Some((score2, end2))) = (align_primer(r1, &s.primer_a_rc), align_primer(r2, &s.primer_b_rc)) {
+        if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_a_rc), align_primer(r2, &s.primer_b_rc)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_a_rc.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_b_rc.len() as f64);
             if debug { eprintln!("Sample: {}, R1FwdRC/R2FwdRC scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1FwdR2Rev, end1, end2));
+                return Some((s, ReadOrientation::R1FwdR2Rev, start1, start2));
             }
         }
         // R1-Rev-RC, R2-Rev-RC
-        if let (Some((score1, end1)), Some((score2, end2))) = (align_primer(r1, &s.primer_b_rc), align_primer(r2, &s.primer_a_rc)) {
+        if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_b_rc), align_primer(r2, &s.primer_a_rc)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_b_rc.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_a_rc.len() as f64);
             if debug { eprintln!("Sample: {}, R1RevRC/R2RevRC scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1RevR2Fwd, end1, end2));
+                return Some((s, ReadOrientation::R1RevR2Fwd, start1, start2));
             }
         }
     }
@@ -300,18 +300,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let chunk_results: Vec<HashMap<_, _>> = chunk.par_iter().map(|(r1_seq, r2_seq)| {
             let mut local_results_map = HashMap::new();
-            if let Some((sample_record, _orientation, end1, end2)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
+            if let Some((sample_record, _orientation, start_trim, end_trim)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
                 if let Some(merged_seq) = merge_reads(r1_seq, r2_seq, 10, 5) {
-                    let start_trim = end1;
-                    let end_trim = end2;
                     if merged_seq.len() > start_trim + end_trim {
                         let trimmed_seq = &merged_seq[start_trim..merged_seq.len() - end_trim];
                         let (gene_id, _score, is_rc) = best_alignment_dual(&genes, trimmed_seq);
                         if gene_id != "Unknown" {
                             let wt_sequence_str = gene_map.get(gene_id).unwrap();
                             let final_gene_seq_bytes = if is_rc { revcomp(trimmed_seq) } else { trimmed_seq.to_vec() };
-                            let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string();
-                            let variant_type = if final_gene_seq == *wt_sequence_str { "Wild Type" } else { "Mutation" };
+                            let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string().to_ascii_uppercase();
+                            let variant_type = if final_gene_seq == *wt_sequence_str { "WildType" } else { "Mutation" };
                             *local_results_map.entry((sample_record.id.clone(), gene_id.to_string(), variant_type.to_string(), final_gene_seq)).or_insert(0) += 1;
                         } else {
                             *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
@@ -347,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0));
-        if variant_type == "Wild Type" {
+        if variant_type == "WildType" {
             stats.0 += *count;
         } else if variant_type == "Mutation" {
             stats.1 += *count;
@@ -364,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Analysis complete. Summary saved to {}", args.output.display());
 
     println!("\nSample Statistics:");
-    println!("Sample ID\tGene\tWild Type\tMutation\tOthers");
+    println!("Sample ID\tGene\tWildType\tMutation\tOthers");
     let mut sorted_keys: Vec<_> = sample_stats.keys().collect();
     sorted_keys.sort();
     
