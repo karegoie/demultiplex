@@ -38,8 +38,6 @@ struct SampleRecord {
     primer_b: Vec<u8>,
     primer_a_rc: Vec<u8>,
     primer_b_rc: Vec<u8>,
-    primer_a_len: usize,
-    primer_b_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +114,6 @@ fn read_samples(path: &PathBuf) -> Result<Vec<SampleRecord>> {
         let primer_b_bytes = pb_specific.as_bytes().to_vec();
         out.push(SampleRecord {
             id,
-            primer_a_len: primer_a_bytes.len(),
-            primer_b_len: primer_b_bytes.len(),
             primer_a: primer_a_bytes.clone(),
             primer_b: primer_b_bytes.clone(),
             primer_a_rc: revcomp(&primer_a_bytes),
@@ -304,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let chunk_results: Vec<HashMap<_, _>> = chunk.par_iter().map(|(r1_seq, r2_seq)| {
             let mut local_results_map = HashMap::new();
-            if let Some((sample_record, orientation, end1, end2)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
+            if let Some((sample_record, _orientation, end1, end2)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
                 if let Some(merged_seq) = merge_reads(r1_seq, r2_seq, 10, 5) {
                     let start_trim = end1;
                     let end_trim = end2;
